@@ -16,6 +16,9 @@
 
 #include <float.h>
 
+#include <cuda.h>
+#include <cudaTypedefs.h>
+
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaTypeUtils.cuh"
 #include "tensorrt_llm/common/cudaUtils.h"
@@ -399,20 +402,20 @@ struct PackedVec<__nv_fp8_e4m3> {
                 "Vector size should match the number of elements per thread.");
 };
 
-// TMA Kernel Traits - Unified configuration for BF16 and FP8 kernels.
+// TMA Kernel Traits - Unified configuration for BF16/FP16 and FP8 kernels.
 template <class InputType>
 struct TmaKernelTraits;
 
-// Specialization for BF16 input (FP16_TO_FP4, FP16_TO_MXFP8)
-// BF16: 2 bytes per element, 16 elements per thread = 32 bytes = 2 float4s
-template <>
-struct TmaKernelTraits<__nv_bfloat16>
+// Base traits for 2-byte types (half, __nv_bfloat16)
+// 2 bytes per element, 16 elements per thread = 32 bytes = 2 float4s
+template <class TwoByteType>
+struct TmaKernelTraitsTwoBytes
 {
-    using InputType = __nv_bfloat16;
-    using SmemType = __nv_bfloat16;
+    using InputType = TwoByteType;
+    using SmemType = TwoByteType;
     
     static constexpr int TMA_ROW_TILE = 16;
-    static constexpr int TMA_COL_TILE = 64;           // 64 BF16 elements = 128 bytes
+    static constexpr int TMA_COL_TILE = 64;           // 64 elements = 128 bytes
     static constexpr int NUM_STAGES = 4;
     static constexpr int SMEM_ROWS = 16;
     static constexpr int SMEM_COLS = 8 * TMA_COL_TILE; // 8 warps * 64 cols
@@ -455,8 +458,8 @@ struct TmaKernelTraits<__nv_bfloat16>
         }
     };
     
-    // Load input vector from shared memory for BF16
-    // Uses SWIZZLE_128B indexing, loads 2 float4s (32 bytes = 16 BF16 elements)
+    // Load input vector from shared memory
+    // Uses SWIZZLE_128B indexing, loads 2 float4s (32 bytes = 16 elements)
     template <typename PackedVecT>
     __device__ static PackedVecT load_input_vec(
         float4 const* base_float4,
@@ -477,6 +480,14 @@ struct TmaKernelTraits<__nv_bfloat16>
         return reinterpret_cast<PackedVecT&>(load_data[0]);
     }
 };
+
+// Specialization for half input (FP16_TO_FP4, FP16_TO_MXFP8)
+template <>
+struct TmaKernelTraits<half> : TmaKernelTraitsTwoBytes<half> {};
+
+// Specialization for BF16 input (FP16_TO_FP4, FP16_TO_MXFP8)
+template <>
+struct TmaKernelTraits<__nv_bfloat16> : TmaKernelTraitsTwoBytes<__nv_bfloat16> {};
 
 // Specialization for FP8 input (FP8_TO_FP4 native)
 // FP8: 1 byte per element, 16 elements per thread = 16 bytes = 1 float4
@@ -554,6 +565,91 @@ template <class InputType>
 constexpr size_t get_tma_smem_size()
 {
     return TMA_BARRIER_SECTION_SIZE + TmaKernelTraits<InputType>::SMEM_DATA_SIZE;
+}
+
+// Get CUtensorMapDataType for input type
+template <class T>
+inline CUtensorMapDataType get_quant_tma_data_type() {
+  if constexpr (std::is_same_v<T, __nv_fp8_e4m3>) {
+    return CU_TENSOR_MAP_DATA_TYPE_UINT8;
+  } else if constexpr (std::is_same_v<T, half>) {
+    return CU_TENSOR_MAP_DATA_TYPE_FLOAT16;
+  } else if constexpr (std::is_same_v<T, __nv_bfloat16>) {
+    return CU_TENSOR_MAP_DATA_TYPE_BFLOAT16;
+  } else {
+    static_assert(sizeof(T) == 0, "Unsupported type for TMA");
+  }
+}
+
+// Create 3D TMA descriptor for quantization throughput kernel
+// The kernel uses coordinates (z=0, y=rowIdx, x=colIdx/TMA_COL_TILE)
+// Each TMA load fetches TMA_ROW_TILE rows and NUM_CONSUMER_WARPS*TMA_COL_TILE columns
+template <class InputType>
+inline CUtensorMap make_3d_tma_quant_desc(InputType const* global_address, 
+                                           int numRows, int numCols) {
+  using Traits = TmaKernelTraits<InputType>;
+  
+  CUtensorMap tensor_map{};
+  constexpr uint32_t rank = 3;
+  
+  // Global tensor dimensions [innermost to outermost]:
+  // dim0 (x): numCols - the x-coordinate is scaled by elem_strides[0]
+  // dim1 (y): numRows 
+  // dim2 (z): 1 (dummy batch dimension, coordinate always 0)
+  uint64_t gmem_dim[rank] = {
+    static_cast<uint64_t>(numCols),
+    static_cast<uint64_t>(numRows),
+    1
+  };
+  
+  // Global strides (in bytes) for each dimension except innermost
+  // Must be multiples of 16 bytes
+  uint64_t global_stride[rank - 1] = {
+    static_cast<uint64_t>(numCols) * sizeof(InputType),  // stride between rows (y dimension)
+    static_cast<uint64_t>(numRows) * numCols * sizeof(InputType)  // stride between batches (z dimension)
+  };
+  
+  // Shared memory box dimensions - elements to load per TMA
+  uint32_t smem_dim[rank] = {
+    static_cast<uint32_t>(Traits::TMA_COL_TILE * Traits::NUM_CONSUMER_WARPS),  // columns per load
+    static_cast<uint32_t>(Traits::TMA_ROW_TILE),                                // rows per load
+    1                                                                           // batch
+  };
+  
+  // Element strides - the x-coordinate is divided by TMA_COL_TILE in the kernel,
+  // so we use elem_strides[0] = TMA_COL_TILE to scale it back
+  uint32_t elem_strides[rank] = {
+    static_cast<uint32_t>(Traits::TMA_COL_TILE),  // x-coord multiplied by this
+    1,                                             // y-coord (row index, used directly)
+    1                                              // z-coord (always 0)
+  };
+  
+  // Get cuTensorMapEncodeTiled function pointer
+  cudaDriverEntryPointQueryResult driver_status;
+  void* cuTensorMapEncodeTiled_ptr = nullptr;
+#if (__CUDACC_VER_MAJOR__ >= 12 && __CUDACC_VER_MINOR__ >= 5)
+  cudaGetDriverEntryPointByVersion("cuTensorMapEncodeTiled", &cuTensorMapEncodeTiled_ptr, 12000,
+                                   cudaEnableDefault, &driver_status);
+#else
+  cudaGetDriverEntryPoint("cuTensorMapEncodeTiled", &cuTensorMapEncodeTiled_ptr, cudaEnableDefault,
+                          &driver_status);
+#endif
+  
+  auto encode_func = reinterpret_cast<PFN_cuTensorMapEncodeTiled_v12000>(cuTensorMapEncodeTiled_ptr);
+  
+  // Swizzle type: 128B for 2-byte types, none for FP8
+  CUtensorMapSwizzle swizzle_type = (sizeof(InputType) == 2) 
+    ? CU_TENSOR_MAP_SWIZZLE_128B 
+    : CU_TENSOR_MAP_SWIZZLE_NONE;
+  
+  encode_func(&tensor_map, get_quant_tma_data_type<InputType>(),
+              rank, const_cast<InputType*>(global_address), gmem_dim, global_stride, 
+              smem_dim, elem_strides,
+              CU_TENSOR_MAP_INTERLEAVE_NONE, swizzle_type,
+              CU_TENSOR_MAP_L2_PROMOTION_NONE,
+              CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+  
+  return tensor_map;
 }
 
 // Quantizes the provided PackedVec into the uint32_t output

@@ -181,62 +181,133 @@ INSTANTIATE_INVOKE_PER_TOKEN_QUANTIZATION(__nv_bfloat16, __nv_fp8_e4m3);
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 // FP4/MXFP8 Quantization
 
+// Threshold for switching to throughput kernel
+static constexpr int FP4_QUANT_THROUGHPUT_THRESHOLD = 1024;
+
 template <typename T, int SF_VEC_SIZE>
 void invokeFP4Quantization(int b, int m, int n, T const* input, float const* SFScale,
                            int64_t* output, int32_t* SFOuput, bool useUE8M0,
                            QuantizationSFLayout layout, int multiProcessorCount, bool enable_pdl,
                            cudaStream_t stream) {
+  // Use throughput kernel for large m values
+  bool useThroughputKernel = (m > FP4_QUANT_THROUGHPUT_THRESHOLD);
+
 #ifdef ENABLE_FP8
   if constexpr (std::is_same_v<T, __nv_fp8_e4m3>) {
-    // Grid, Block size.
-    // Each thread converts 16 values.
-    dim3 block(std::min(int(n / CVT_FP8_TO_FP4_ELTS_PER_THREAD), 512));
-    // Get number of blocks per SM (assume we can fully utilize the SM).
-    int const numBlocksPerSM = std::max(1u, 2048u / block.x);
-    int effectiveRows = computeEffectiveRows(m, layout);
-    dim3 grid(std::min(effectiveRows, multiProcessorCount * numBlocksPerSM));
+    if (useThroughputKernel) {
+      // Use throughput kernel with TMA for large m
+      using Traits = TmaKernelTraits<T>;
+      int effectiveRows = computeEffectiveRows(m, layout);
+      dim3 block(288);  // 1 producer warp + 8 consumer warps + padding
+      dim3 grid(std::min((effectiveRows + Traits::TMA_ROW_TILE - 1) / Traits::TMA_ROW_TILE,
+                         multiProcessorCount * 2));
 
-    // Launch the cvt kernel.
-    auto* kernel_instance = useUE8M0
-                                ? &quantize_with_block_size<BlockScaleQuantizationType::FP8_TO_FP4,
-                                                            T, SF_VEC_SIZE, true>
-                                : &quantize_with_block_size<BlockScaleQuantizationType::FP8_TO_FP4,
-                                                            T, SF_VEC_SIZE, false>;
-    kernel_instance<<<grid, block, 0, stream>>>(b, m, n, n, input, SFScale,
-                                                reinterpret_cast<uint32_t*>(output),
-                                                reinterpret_cast<uint32_t*>(SFOuput), layout);
+      // Create TMA descriptor
+      CUtensorMap tensor_map = make_3d_tma_quant_desc<T>(input, m, n);
 
+      // Get shared memory size
+      size_t smem_size = get_tma_smem_size<T>();
+
+      auto* kernel_instance = useUE8M0
+          ? &quantize_with_block_size_throughput<BlockScaleQuantizationType::FP8_TO_FP4,
+                                                  T, SF_VEC_SIZE, true>
+          : &quantize_with_block_size_throughput<BlockScaleQuantizationType::FP8_TO_FP4,
+                                                  T, SF_VEC_SIZE, false>;
+
+      cudaLaunchConfig_t config;
+      config.gridDim = grid;
+      config.blockDim = block;
+      config.dynamicSmemBytes = smem_size;
+      config.stream = stream;
+      cudaLaunchAttribute attrs[1];
+      attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+      attrs[0].val.programmaticStreamSerializationAllowed = enable_pdl;
+      config.numAttrs = 1;
+      config.attrs = attrs;
+      cudaFuncSetAttribute(kernel_instance, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
+      cudaLaunchKernelEx(&config, kernel_instance, b, m, n, n, input, SFScale,
+                         reinterpret_cast<uint32_t*>(output), reinterpret_cast<uint32_t*>(SFOuput),
+                         layout, tensor_map);
+    } else {
+      // Original path for small m
+      dim3 block(std::min(int(n / CVT_FP8_TO_FP4_ELTS_PER_THREAD), 512));
+      int const numBlocksPerSM = std::max(1u, 2048u / block.x);
+      int effectiveRows = computeEffectiveRows(m, layout);
+      dim3 grid(std::min(effectiveRows, multiProcessorCount * numBlocksPerSM));
+
+      auto* kernel_instance = useUE8M0
+          ? &quantize_with_block_size<BlockScaleQuantizationType::FP8_TO_FP4,
+                                      T, SF_VEC_SIZE, true>
+          : &quantize_with_block_size<BlockScaleQuantizationType::FP8_TO_FP4,
+                                      T, SF_VEC_SIZE, false>;
+      kernel_instance<<<grid, block, 0, stream>>>(b, m, n, n, input, SFScale,
+                                                  reinterpret_cast<uint32_t*>(output),
+                                                  reinterpret_cast<uint32_t*>(SFOuput), layout);
+    }
   } else
 #endif
   {
-    // Grid, Block size.
-    // Each thread converts 8 values.
-    dim3 block(std::min(int(n / CVT_ELTS_PER_THREAD), 512));
-    // Get number of blocks per SM (assume we can fully utilize the SM).
-    int const numBlocksPerSM = std::max(1u, 2048u / block.x);
-    int effectiveRows = computeEffectiveRows(m, layout);
-    dim3 grid(std::min(effectiveRows, multiProcessorCount * numBlocksPerSM));
+    if (useThroughputKernel) {
+      // Use throughput kernel with TMA for large m
+      using Traits = TmaKernelTraits<T>;
+      int effectiveRows = computeEffectiveRows(m, layout);
+      dim3 block(288);  // 1 producer warp + 8 consumer warps + padding
+      dim3 grid(std::min((effectiveRows + Traits::TMA_ROW_TILE - 1) / Traits::TMA_ROW_TILE,
+                         multiProcessorCount * 2));
 
-    // Launch the cvt kernel.
-    auto* kernel_instance = useUE8M0
-                                ? &quantize_with_block_size<BlockScaleQuantizationType::FP16_TO_FP4,
-                                                            T, SF_VEC_SIZE, true>
-                                : &quantize_with_block_size<BlockScaleQuantizationType::FP16_TO_FP4,
-                                                            T, SF_VEC_SIZE, false>;
+      // Create TMA descriptor
+      CUtensorMap tensor_map = make_3d_tma_quant_desc<T>(input, m, n);
 
-    cudaLaunchConfig_t config;
-    config.gridDim = grid;
-    config.blockDim = block;
-    config.dynamicSmemBytes = 0;
-    config.stream = stream;
-    cudaLaunchAttribute attrs[1];
-    attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-    attrs[0].val.programmaticStreamSerializationAllowed = enable_pdl;
-    config.numAttrs = 1;
-    config.attrs = attrs;
-    cudaLaunchKernelEx(&config, kernel_instance, b, m, n, n, input, SFScale,
-                       reinterpret_cast<uint32_t*>(output), reinterpret_cast<uint32_t*>(SFOuput),
-                       layout);
+      // Get shared memory size
+      size_t smem_size = get_tma_smem_size<T>();
+
+      auto* kernel_instance = useUE8M0
+          ? &quantize_with_block_size_throughput<BlockScaleQuantizationType::FP16_TO_FP4,
+                                                  T, SF_VEC_SIZE, true>
+          : &quantize_with_block_size_throughput<BlockScaleQuantizationType::FP16_TO_FP4,
+                                                  T, SF_VEC_SIZE, false>;
+
+      cudaLaunchConfig_t config;
+      config.gridDim = grid;
+      config.blockDim = block;
+      config.dynamicSmemBytes = smem_size;
+      config.stream = stream;
+      cudaLaunchAttribute attrs[1];
+      attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+      attrs[0].val.programmaticStreamSerializationAllowed = enable_pdl;
+      config.numAttrs = 1;
+      config.attrs = attrs;
+      cudaFuncSetAttribute(kernel_instance, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
+      cudaLaunchKernelEx(&config, kernel_instance, b, m, n, n, input, SFScale,
+                         reinterpret_cast<uint32_t*>(output), reinterpret_cast<uint32_t*>(SFOuput),
+                         layout, tensor_map);
+    } else {
+      // Original path for small m
+      dim3 block(std::min(int(n / CVT_ELTS_PER_THREAD), 512));
+      int const numBlocksPerSM = std::max(1u, 2048u / block.x);
+      int effectiveRows = computeEffectiveRows(m, layout);
+      dim3 grid(std::min(effectiveRows, multiProcessorCount * numBlocksPerSM));
+
+      auto* kernel_instance = useUE8M0
+          ? &quantize_with_block_size<BlockScaleQuantizationType::FP16_TO_FP4,
+                                      T, SF_VEC_SIZE, true>
+          : &quantize_with_block_size<BlockScaleQuantizationType::FP16_TO_FP4,
+                                      T, SF_VEC_SIZE, false>;
+
+      cudaLaunchConfig_t config;
+      config.gridDim = grid;
+      config.blockDim = block;
+      config.dynamicSmemBytes = 0;
+      config.stream = stream;
+      cudaLaunchAttribute attrs[1];
+      attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+      attrs[0].val.programmaticStreamSerializationAllowed = enable_pdl;
+      config.numAttrs = 1;
+      config.attrs = attrs;
+      cudaLaunchKernelEx(&config, kernel_instance, b, m, n, n, input, SFScale,
+                         reinterpret_cast<uint32_t*>(output), reinterpret_cast<uint32_t*>(SFOuput),
+                         layout);
+    }
   }
 }
 
